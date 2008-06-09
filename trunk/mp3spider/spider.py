@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 # all database threading code by Wim Schut, copied from here:
 # http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/496799
 
@@ -11,17 +9,18 @@ import Queue, time, thread
 from threading import Thread
 import re
 
-threads = [False, False, False, False]
-
 _threadex = thread.allocate_lock()
 qthreads = 0
 sqlqueue = Queue.Queue()
+urlqueue = Queue.Queue()
 
 ConnectCmd = "connect"
 SqlCmd = "SQL"
 StopCmd = "stop"
+threads = 4
+
 class DbCmd:
-    def __init__(self, cmd, params=[]):
+    def __init__(self, cmd, params=None):
         self.cmd = cmd
         self.params = params
 
@@ -40,7 +39,7 @@ class DbWrapper(Thread):
             if s.cmd == SqlCmd:
                 commitneeded = False
                 res = []
-#               s.params is a list to bundle statements into a "transaction"
+                # s.params is a list to bundle statements into a "transaction"
                 for sql in s.params:
                     cur.execute(sql[0],sql[1])
                     if not sql[0].upper().startswith("SELECT"): 
@@ -52,7 +51,7 @@ class DbWrapper(Thread):
                 _threadex.acquire()
                 qthreads -= 1
                 _threadex.release()
-#               allow other threads to stop
+                # allow other threads to stop
                 sqlqueue.put(s)
                 s.resultqueue.put(None)
                 break
@@ -68,7 +67,7 @@ def execSQL(s):
     elif s.cmd == StopCmd:
         s.resultqueue = Queue.Queue()
         sqlqueue.put(s)
-#       sleep until all threads are stopped
+        # sleep until all threads are stopped
         while qthreads > 0: time.sleep(0.1)
     else:
         s.resultqueue = Queue.Queue()
@@ -155,34 +154,48 @@ def create_db():
     connection.commit()
 
 
-class Spider:
+class Spider(Thread):
     """
     The heart of this program, finds all links within a web site.
 
-    run() contains the main loop.
     process_page() retrieves each page and finds the links.
     """
-
-    def __init__(self, max_depth=1, log=None):
+    def __init__(self, queue, action, thread, max_depth=1):
         self.max_depth = max_depth
-        if log is None:
-            #use log_stdout function if no log provided
-            self.log = log_stdout
-        else:
-            self.log = log
+        self.action = action
+        self.queue = queue
+        self.thread = thread
+        Thread.__init__(self)
+        self.log = log_stdout
 
-    def set_start_url(self, start_url):
+    def run(self):
+        if self.action == 'spider':
+            while True:
+                #grabs host from queue
+                self.process_url(self.queue.get())            
+                #signals to queue job is done
+                self.queue.task_done()
+            return
+        if self.action == 'download':
+            while True:
+                #grabs host from queue
+                self.download_file(self.queue.get())            
+                #signals to queue job is done
+                self.queue.task_done()
+            return
+
+    def set_start_url(self, url):
         self.URLs = set()
-        self.start_url = start_url
-        self.URLs.add(start_url)
-        self._links_to_process = [(start_url, 0)]
-    
+        self.start_url = url
+        self.URLs.add(url)
+        self._links_to_process = [(url, 0)]
+
     def insert_blog_url(self):
         row = execSQL(DbCmd(
             SqlCmd,
             [("SELECT * FROM blog_urls WHERE url = ?", (self.start_url,))]))
         if row:
-            print "blog already added"
+            print "T%s: blog already added" % self.thread
             return
         execSQL(DbCmd(
             SqlCmd,
@@ -193,7 +206,7 @@ class Spider:
             SqlCmd,
             [("SELECT * FROM file_urls WHERE url = ?", (url,))]))
         if row:
-            print "file already added"
+            print "T%s: file already added" % self.thread
             return
         execSQL(DbCmd(
             SqlCmd,
@@ -218,23 +231,16 @@ class Spider:
         execSQL(DbCmd(SqlCmd,[(
             "UPDATE file_urls SET downloaded = True WHERE url = ?", (url,))]))
 
-
-    def process_url(self, start_url, thread=0):
+    def process_url(self, start_url):
         #process list of URLs one at a time
-        global threads
-        try:
-            print "STARTING THREAD %s, maxdepth %s" % (thread, self.max_depth)
-            self.update_blog_url(start_url)
-            self.set_start_url(start_url)
-            while self._links_to_process:
-                url, url_depth = self._links_to_process.pop()
-                self.log("Retrieving: %s - %s " % (url_depth, url))
-                self.process_page(url, url_depth)
-            print "STOPPING THREAD %s" % thread
-        finally:
-            _threadex.acquire()
-            threads[thread] = False
-            _threadex.release()
+        print "STARTING T%s, maxdepth %s" % (self.thread, self.max_depth)
+        self.update_blog_url(start_url)
+        self.set_start_url(start_url)
+        while self._links_to_process:
+            url, url_depth = self._links_to_process.pop()
+            self.log("T%s: Retrieving: %s - %s " % (
+                self.thread, url_depth, url))
+            self.process_page(url, url_depth)
         
     def url_in_site(self, link):
         #checks weather the link starts with the base URL
@@ -263,77 +269,57 @@ class Spider:
                 if self.url_exists(link):
                     self.URLs.add(link)
                     continue
-                self.log("adding " + link)
+                self.log("T%s: adding %s" %(self.thread, link))
                 self.URLs.add(link)
                 self.insert_file_url(link)
             elif (new_depth <= self.max_depth and self.url_in_site(link)):
                 self.URLs.add(link)
                 self._links_to_process.append((link, new_depth))
             time.sleep(0.1)
-            
+
+    def download_file(self, url):
+        print "T%s: %s" % (self.thread, url)
+        if not url.startswith("http://") and not url.startswith("https://"):
+            print "T%s: weird link" % self.thread
+            execSQL(DbCmd(
+                SqlCmd,
+                [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+            return
+        for alt in alternate_urls(url):
+            if os.path.exists(alt.split('://')[1]):
+                print "T%s: already there" % self.thread
+                execSQL(DbCmd(
+                    SqlCmd,
+                    [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+                return
+        try:
+            os.popen(
+                'curl -s --max-time 600 --connect-timeout 10 --user-agent'
+                ' "Mozilla/5.0" --create-dirs --globoff --max-filesize'
+                ' 30000000 -o "%s" "%s"' % (urllib2.unquote(url.split('://')[1]), url))
+        except:
+            pass       
+        execSQL(DbCmd(
+            SqlCmd,
+            [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+
 def get_blog_urls():
     url_tups = execSQL(
         DbCmd(SqlCmd, [("SELECT url FROM blog_urls ORDER BY updated;", ())]))
     result = [tup[0] for tup in url_tups]
     return result
-
-def download_file(url, thread=0):
-    global threads
-    print "%s" % url
-    if not url.startswith("http://") and not url.startswith("https://"):
-        print "weird link"
-        execSQL(DbCmd(
-            SqlCmd,
-            [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
-        _threadex.acquire()
-        threads[thread] = False
-        _threadex.release()
-        return
-    for alt in alternate_urls(url):
-        if os.path.exists(alt.split('://')[1]):
-            print "already there"
-            execSQL(DbCmd(
-                SqlCmd,
-                [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
-            _threadex.acquire()
-            threads[thread] = False
-            _threadex.release()
-            return
-    try:
-        os.popen(
-            'curl -s --max-time 600 --connect-timeout 10 --user-agent'
-            ' "Mozilla/5.0" --create-dirs --globoff --max-filesize'
-            ' 30000000 -o "%s" "%s"'
-            % (urllib2.unquote(url.split('://')[1]), url))
-    except:
-        pass       
-    execSQL(DbCmd(
-        SqlCmd,
-        [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
-    _threadex.acquire()
-    threads[thread] = False
-    _threadex.release()
     
 def download_files(n=100):
     execSQL(DbCmd(ConnectCmd, "urls.db"))
-    rows = execSQL(DbCmd(
+    for i in range(threads):
+        s = Spider(urlqueue, 'download', str(i))
+        s.setDaemon(True)
+        s.start()
+    for row in execSQL(DbCmd(
         SqlCmd,
-        [("SELECT url FROM file_urls WHERE downloaded = ?;", (False,))]))[:n]
-    print "%s files to download" % len(rows)
-    while rows:
-        if False in threads:
-            ix = threads.index(False)
-            _threadex.acquire()
-            threads[ix] = True
-            _threadex.release()
-            bg = threading.Thread(
-                None, download_file, args=(rows.pop(0)[0], ix))
-            bg.setDaemon(True)
-            bg.start()
-    while True in threads:
-        time.sleep(10)
-        print "waiting"
-        pass
+        [("SELECT url FROM file_urls WHERE downloaded = ?;", (False,))]))[:n]:
+        urlqueue.put(row[0])
+    urlqueue.join()
     execSQL(DbCmd(StopCmd))
         
 def add(url):
@@ -350,6 +336,7 @@ def add(url):
                    "(?)", (url,))
     connection.commit()
 
+
 def undo():
     connection = sqlite3.connect("urls.db")
     cursor = connection.cursor()
@@ -363,33 +350,16 @@ def undo():
     undos.close()
     connection.close()
 
-def spider(url=None, depth=1):
-    global threads
+
+def spider(depth=1):
     execSQL(DbCmd(ConnectCmd, "urls.db"))
-    if url:
-        spidey = Spider(max_depth=depth)
-        spider.process_url(url)
-        return
-    urls = get_blog_urls()
-    spiders = {}
-    for ix in range(len(threads)):
-        spiders[ix] = Spider(max_depth=depth)
-    execSQL(DbCmd(ConnectCmd, "urls.db"))
-    while urls:
-        if False in threads:
-            ix = threads.index(False)
-            _threadex.acquire()
-            threads[ix] = True
-            _threadex.release()
-            bg = threading.Thread(
-                None, spiders[ix].process_url, args=(urls.pop(0), ix))
-            bg.setDaemon(True)
-            bg.start()
-        time.sleep(0.1)
-    while True in threads:
-        time.sleep(10)
-        print "waiting"
-        pass
+    for i in range(threads):
+        s = Spider(urlqueue, 'spider', str(i), max_depth=depth)
+        s.setDaemon(True)
+        s.start()
+    for url in get_blog_urls():
+        urlqueue.put(url)
+    urlqueue.join()
     execSQL(DbCmd(StopCmd))
             
 if __name__ == '__main__':
@@ -408,6 +378,3 @@ if __name__ == '__main__':
         add(sys.argv[2])
     if sys.argv[1] == 'undo':
         undo()
-    if sys.argv[1] == 'deep':
-        spider(sys.argv[2], 5)
-
