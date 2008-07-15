@@ -6,6 +6,7 @@ import urllib2, threading
 import urlparse
 import sqlite3
 import Queue, time, thread
+from datetime import datetime, timedelta
 from threading import Thread
 import re
 
@@ -304,9 +305,17 @@ class Spider(Thread):
             [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
 
 def get_blog_urls():
+    week = timedelta(7)
+    last_week = datetime.now() - week
+    year = last_week.year
+    month = last_week.month
+    day = last_week.day
     url_tups = execSQL(
-        DbCmd(SqlCmd, [("SELECT url FROM blog_urls ORDER BY updated;", ())]))
+        DbCmd(SqlCmd, [
+        ("SELECT url FROM blog_urls WHERE updated < '%04d-%02d-%02d' ORDER BY updated;" % (year, month, day),
+         ())]))
     result = [tup[0] for tup in url_tups]
+    print "%s blogs to harvest" % str(len(result))
     return result
     
 def download_files(n=100):
@@ -336,7 +345,6 @@ def add(url):
                    "(?)", (url,))
     connection.commit()
 
-
 def undo():
     connection = sqlite3.connect("urls.db")
     cursor = connection.cursor()
@@ -349,7 +357,6 @@ def undo():
         connection.commit()
     undos.close()
     connection.close()
-
 
 def spider(depth=1):
     execSQL(DbCmd(ConnectCmd, "urls.db"))
