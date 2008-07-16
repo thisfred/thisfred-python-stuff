@@ -245,7 +245,10 @@ class Spider(Thread):
         
     def url_in_site(self, link):
         #checks weather the link starts with the base URL
-        return link.startswith(self.start_url)
+        try:
+            return link.startswith(self.start_url)
+        except UnicodeDecodeError:
+            return False
 
     def process_page(self, url, depth):
         #retrieves page and finds links in it
